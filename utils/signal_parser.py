@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 import statistics
 import logging
+import unicodedata
 
 getcontext().prec = 20
 
@@ -43,7 +44,7 @@ def format_decimal(d: Optional[Decimal]) -> str:
         s = s.rstrip('0').rstrip('.')
     return s
 
-class UltimateSignalParser:
+class SignalParser:
     def __init__(self):
         self.num_pattern = r'\b\d+(?:[\.,]\d+)*(?:[eE][+-]?\d+)?(?:\s*[kKмМ%])?(?!\d)'
         # Стоп-слова, которые не могут быть тикерами
@@ -165,188 +166,202 @@ class UltimateSignalParser:
 
 
     def parse(self, text: str) -> Optional[Signal]:
-        logging.info("=" * 60)
-        logging.info(f"\nSignal parse: {text}\n")
-        logging.info("=" * 60)
-        if not text or len(text) < 5:
-            return None
+        try:
+            if not text:
+                return None
+            if text.strip().upper().startswith(("SET TP", "SET SL")):
+                logging.info("ℹ️ Пропуск повідомлення оновлення (SET TP/SL)")
+                return None
+            logging.info("=" * 60)
+            logging.info(f"\nSignal parse: {text}\n")
+            logging.info("=" * 60)
+            if not text or len(text) < 5:
+                return None
 
-        # --- SYMBOL ---
-        symbol = self._extract_symbol(text)
-        if not symbol:
-            return None
+            text = unicodedata.normalize('NFKD', text)
 
-        symbol = re.sub(r'USDT$|USD$', '', symbol)
+            # --- SYMBOL ---
+            symbol = self._extract_symbol(text)
+            if not symbol:
+                return None
 
-        if symbol in self.invalid_symbols or symbol.isdigit():
-            return None
+            symbol = re.sub(r'USDT$|USD$', '', symbol)
 
-        # --- SIDE ---
-        side_text = text.upper()
-        if re.search(r'\b(SHORT|SELL|🔴|ШОРТ|📉|DOWN)\b', side_text):
-            side = 'SHORT'
-        else:
-            side = 'LONG'
+            if symbol in self.invalid_symbols or symbol.isdigit():
+                return None
 
-        is_market = bool(re.search(r'(Market|CMP|Now|Enter at|Current|@)', text, re.I))
-
-        # --- CLEAN TEXT ---
-        clean_text = re.sub(r'[()➡️\[\]\-\–\—/]', ' ', text)
-
-        entry_m = r'(Entry|Limit|Вход|Zon|Entries|@)'
-        tp_m = r'(Take|Target|TP|Тейк)'
-        sl_m = r'(Stop|SL|Стоп|ST\s*\:)'
-
-        markers = []
-        for m in re.finditer(entry_m, clean_text, re.I):
-            markers.append((m.start(), 'entry'))
-        for m in re.finditer(tp_m, clean_text, re.I):
-            markers.append((m.start(), 'tp'))
-        for m in re.finditer(sl_m, clean_text, re.I):
-            markers.append((m.start(), 'sl'))
-
-        markers.sort()
-
-        entries_raw, tps_raw, sl_val = [], [], None
-
-        # --- EXTRACTION ---
-        if not markers:
-            nums = self._extract_numbers(clean_text)
-            if len(nums) >= 3:
-                entries_raw = [nums[0]]
-                tps_raw = nums[1:-1]
-                sl_val = nums[-1][0]
-        else:
-            if markers[0][1] != 'entry' and not is_market:
-                entries_raw = self._extract_numbers(clean_text[:markers[0][0]])
-
-            for i in range(len(markers)):
-                start, role = markers[i]
-                end = markers[i+1][0] if i+1 < len(markers) else len(clean_text)
-                chunk = clean_text[start:end]
-                nums = self._extract_numbers(chunk, is_tp=(role == 'tp'))
-
-                if role == 'entry':
-                    entries_raw.extend(nums)
-                elif role == 'tp':
-                    tps_raw.extend(nums)
-                elif role == 'sl':
-                    # Убираем нумерацию типа "1) "
-                    cleaned_chunk = re.sub(r'(?m)^\s*\d+\s*[)\-]\s*', ' ', chunk)
-
-                    # Убираем проценты типа 3-5%
-                    cleaned_chunk = re.sub(r'\d+\s*-\s*\d+\s*%', ' ', cleaned_chunk)
-                    cleaned_chunk = re.sub(r'\d+\s*%', ' ', cleaned_chunk)
-
-                    nums = self._extract_numbers(cleaned_chunk)
-
-                    if nums:
-                        # Берём ПЕРВОЕ найденное число
-                        sl_val = nums[0][0]
-
-        # --- LEVERAGE ---
-        lev_match = re.search(r'(\d{1,3})\s*[xX]\b', text)
-        leverage = int(lev_match.group(1)) if lev_match else 25
-
-        # --- BUILD FINAL ---
-        final_entries = [e[0] for e in entries_raw][:2]
-        final_targets = [e[0] for e in tps_raw]
-
-        # ==========================================================
-        # 🔥 FALLBACK: если TP не нашли, но есть Entry и SL
-        # (формат как в JELLYJELLY — тейки просто строками)
-        # ==========================================================
-        if final_entries and not final_targets and sl_val:
-            entry_match = re.search(r'(Entry[^\n]*)', clean_text, re.I)
-            sl_match = re.search(r'(Stop[^\n]*)', clean_text, re.I)
-
-            if entry_match and sl_match and sl_match.start() > entry_match.end():
-                between_text = clean_text[entry_match.end():sl_match.start()]
-                extra_nums = self._extract_numbers(between_text)
-
-                for num, _ in extra_nums:
-                    if side == "LONG" and num > final_entries[0]:
-                        final_targets.append(num)
-                    elif side == "SHORT" and num < final_entries[0]:
-                        final_targets.append(num)
-
-        clean_text_for_tp = re.sub(r'Trading risk.*?\d+\s*-\s*\d+%', '', text, flags=re.I)
-
-        tp_percent_match = re.search(
-            r'(?:TP|Target|Take\s*Profit)\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*%?\s*[-–]\s*(\d+(?:\.\d+)?)\s*%?',
-            clean_text_for_tp, re.I
-        )
-
-        if tp_percent_match:
-            tp1_pct = Decimal(tp_percent_match.group(1))
-            tp2_pct = Decimal(tp_percent_match.group(2))
-            if(len(final_entries) > 0):
-                entry_price = final_entries[0]
+            # --- SIDE ---
+            side_text = text.upper()
+            if re.search(r'\b(SHORT|SELL|🔴|ШОРТ|📉|DOWN)\b', side_text):
+                side = 'SHORT'
             else:
-                currency_price = self.get_current_price(symbol)
-                entry_price = currency_price
+                side = 'LONG'
+
+            is_market = bool(re.search(r'(Market|CMP|Now|Enter at|Current|@)', text, re.I))
+
+            # --- CLEAN TEXT ---
+            clean_text = re.sub(r'[()➡️\[\]\-\–\—/]', ' ', text)
+
+            entry_m = r'(Entry|Limit|Вход|Zon|Entries|@)'
+            tp_m = r'(Take|Target|TP|Тейк)'
+            sl_m = r'(Stop|SL|Стоп|ST\s*\:)'
+
+            markers = []
+            for m in re.finditer(entry_m, clean_text, re.I):
+                markers.append((m.start(), 'entry'))
+            for m in re.finditer(tp_m, clean_text, re.I):
+                markers.append((m.start(), 'tp'))
+            for m in re.finditer(sl_m, clean_text, re.I):
+                markers.append((m.start(), 'sl'))
+
+            markers.sort()
+
+            entries_raw, tps_raw, sl_val = [], [], None
+
+            # --- EXTRACTION ---
+            if not markers:
+                nums = self._extract_numbers(clean_text)
+                if len(nums) >= 3:
+                    entries_raw = [nums[0]]
+                    tps_raw = nums[1:-1]
+                    sl_val = nums[-1][0]
+            else:
+                if markers[0][1] != 'entry' and not is_market:
+                    entries_raw = self._extract_numbers(clean_text[:markers[0][0]])
+
+                for i in range(len(markers)):
+                    start, role = markers[i]
+                    end = markers[i+1][0] if i+1 < len(markers) else len(clean_text)
+                    chunk = clean_text[start:end]
+                    nums = self._extract_numbers(chunk, is_tp=(role == 'tp'))
+
+                    if role == 'entry':
+                        entries_raw.extend(nums)
+                    elif role == 'tp':
+                        tps_raw.extend(nums)
+                    elif role == 'sl':
+                        # Убираем нумерацию типа "1) "
+                        cleaned_chunk = re.sub(r'(?m)^\s*\d+\s*[)\-]\s*', ' ', chunk)
+
+                        # Убираем проценты типа 3-5%
+                        cleaned_chunk = re.sub(r'\d+\s*-\s*\d+\s*%', ' ', cleaned_chunk)
+                        cleaned_chunk = re.sub(r'\d+\s*%', ' ', cleaned_chunk)
+
+                        nums = self._extract_numbers(cleaned_chunk)
+
+                        if nums:
+                            # Берём ПЕРВОЕ найденное число
+                            sl_val = nums[0][0]
+
+            # --- LEVERAGE ---
+            lev_match = re.search(r'(\d{1,3})\s*[xX]\b', text)
+            leverage = int(lev_match.group(1)) if lev_match else 25
+
+            # --- BUILD FINAL ---
+            final_entries = [e[0] for e in entries_raw][:2]
+            final_targets = [e[0] for e in tps_raw]
+
+            # ==========================================================
+            # 🔥 FALLBACK: если TP не нашли, но есть Entry и SL
+            # (формат как в JELLYJELLY — тейки просто строками)
+            # ==========================================================
+            if final_entries and not final_targets and sl_val:
+                entry_match = re.search(r'(Entry[^\n]*)', clean_text, re.I)
+                sl_match = re.search(r'(Stop[^\n]*)', clean_text, re.I)
+
+                if entry_match and sl_match and sl_match.start() > entry_match.end():
+                    between_text = clean_text[entry_match.end():sl_match.start()]
+                    extra_nums = self._extract_numbers(between_text)
+
+                    for num, _ in extra_nums:
+                        if side == "LONG" and num > final_entries[0]:
+                            final_targets.append(num)
+                        elif side == "SHORT" and num < final_entries[0]:
+                            final_targets.append(num)
+
+            clean_text_for_tp = re.sub(r'Trading risk.*?\d+\s*-\s*\d+%', '', text, flags=re.I)
+
+            tp_percent_match = re.search(
+                r'(?:TP|Target|Take\s*Profit)\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*%?\s*[-–]\s*(\d+(?:\.\d+)?)\s*%?',
+                clean_text_for_tp, re.I
+            )
+
+            if tp_percent_match:
+                tp1_pct = Decimal(tp_percent_match.group(1))
+                tp2_pct = Decimal(tp_percent_match.group(2))
+                if(len(final_entries) > 0):
+                    entry_price = final_entries[0]
+                else:
+                    currency_price = self.get_current_price(symbol)
+                    entry_price = currency_price
+                
+                factor = Decimal(1) / Decimal(leverage)
+                final_targets = [
+                    entry_price * (1 + tp1_pct * factor / 100),
+                    entry_price * (1 + tp2_pct * factor / 100)
+                ]
+
+            # Ограничение тейков
+            final_targets = final_targets[:10]
+
+            tp_set = set(final_targets)
+            final_entries = [e for e in final_entries if e not in tp_set]
+
+            if final_entries:
+                final_entries = self.remove_outlier(final_entries)
             
-            factor = Decimal(1) / Decimal(leverage)
-            final_targets = [
-                entry_price * (1 + tp1_pct * factor / 100),
-                entry_price * (1 + tp2_pct * factor / 100)
-            ]
+            final_targets = self.remove_outlier(final_targets)
 
-        # Ограничение тейков
-        final_targets = final_targets[:10]
+            entry = None
+            if len(final_entries) > 1:
+                entry = (final_entries[0] + final_entries[1]) / 2
+            elif len(final_entries) == 1:
+                entry = final_entries[0]
 
-        tp_set = set(final_targets)
-        final_entries = [e for e in final_entries if e not in tp_set]
+            signal = Signal(
+                symbol=symbol,
+                side=side,
+                entry = entry,
+                entry_range=final_entries,
+                targets=final_targets,
+                sl=sl_val,
+                leverage=leverage,
+                is_market=is_market,
+                raw_text=text
+            )
 
-        if final_entries:
-            final_entries = self.remove_outlier(final_entries)
-        
-        final_targets = self.remove_outlier(final_targets)
+            logging.info("=" * 60)
+            logging.info("✅ СИГНАЛ УСПЕШНО РАСПОЗНАН")
+            logging.info(f"   Symbol: {signal.symbol}")
+            logging.info(f"   Side: {signal.side.upper()}")
+            logging.info(f"   Entry: {format_decimal(signal.entry) if signal.entry else 'MARKET'}")
+            if signal.entry_range:
+                if len(signal.entry_range) == 1:
+                    logging.info(f"   Entry Range: ({format_decimal(signal.entry_range[0])})")
+                else:
+                    logging.info(f"   Entry Range: ({format_decimal(signal.entry_range[0])}, {format_decimal(signal.entry_range[1])})")
 
-        entry = None
-        if len(final_entries) > 1:
-            entry = (final_entries[0] + final_entries[1]) / 2
-        elif len(final_entries) == 1:
-            entry = final_entries[0]
-
-        signal = Signal(
-            symbol=symbol,
-            side=side,
-            entry = entry,
-            entry_range=final_entries,
-            targets=final_targets,
-            sl=sl_val,
-            leverage=leverage,
-            is_market=is_market,
-            raw_text=text
-        )
-
-        logging.info("=" * 60)
-        logging.info("✅ СИГНАЛ УСПЕШНО РАСПОЗНАН")
-        logging.info(f"   Symbol: {signal.symbol}")
-        logging.info(f"   Side: {signal.side.upper()}")
-        logging.info(f"   Entry: {format_decimal(signal.entry) if signal.entry else 'MARKET'}")
-        if signal.entry_range:
-            if len(signal.entry_range) == 1:
-                logging.info(f"   Entry Range: ({format_decimal(signal.entry_range[0])})")
+            if signal.targets:
+                tp_parts = [f"TP{i+1}: {format_decimal(tp)}" for i, tp in enumerate(signal.targets)]
+                logging.info(f"   {', '.join(tp_parts)}")
             else:
-                logging.info(f"   Entry Range: ({format_decimal(signal.entry_range[0])}, {format_decimal(signal.entry_range[1])})")
+                logging.info("   TP: None")
 
-        if signal.targets:
-            tp_parts = [f"TP{i+1}: {format_decimal(tp)}" for i, tp in enumerate(signal.targets)]
-            logging.info(f"   {', '.join(tp_parts)}")
-        else:
-            logging.info("   TP: None")
+            logging.info(f"   SL: {format_decimal(signal.sl)}")
+            logging.info(f"   Leverage: {signal.leverage}x")
+            logging.info("=" * 60)
 
-        logging.info(f"   SL: {format_decimal(signal.sl)}")
-        logging.info(f"   Leverage: {signal.leverage}x")
-        logging.info("=" * 60)
-
-        return signal
+            return signal
+        
+        except Exception as e:
+            logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return None
     
 # --- ТЕСТ ПАРСЕРА ---
 if __name__ == "__main__":
-    parser = UltimateSignalParser()
+    parser = SignalParser()
 
     logging.basicConfig(
         level=logging.DEBUG,
